@@ -15,6 +15,10 @@ inputs:
     description: "Glob patterns to exclude files from the diff analysis"
     required: false
     default: ""
+  MAX_COMMENTS_PER_PR:
+    description: "Maximum number of comments to add per pull request"
+    required: false
+    default: "10"
 runs:
   using: "node16"
   main: "dist/index.js"

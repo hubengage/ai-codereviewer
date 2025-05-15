@@ -51,6 +51,7 @@ const minimatch_1 = __importDefault(__nccwpck_require__(2002));
 const GITHUB_TOKEN = core.getInput("GITHUB_TOKEN");
 const OPENAI_API_KEY = core.getInput("OPENAI_API_KEY");
 const OPENAI_API_MODEL = core.getInput("OPENAI_API_MODEL");
+const MAX_COMMENTS_PER_PR = parseInt(core.getInput("MAX_COMMENTS_PER_PR") || "10", 10);
 const octokit = new rest_1.Octokit({ auth: GITHUB_TOKEN });
 const openai = new openai_1.default({
     apiKey: OPENAI_API_KEY,
@@ -88,31 +89,104 @@ function getDiff(owner, repo, pull_number) {
 function analyzeCode(parsedDiff, prDetails) {
     return __awaiter(this, void 0, void 0, function* () {
         const comments = [];
+        const maxChangesPerChunk = 100; // Limit to prevent too large prompts
         for (const file of parsedDiff) {
             if (file.to === "/dev/null")
                 continue; // Ignore deleted files
-            for (const chunk of file.chunks) {
-                const prompt = createPrompt(file, chunk, prDetails);
+            // Group chunks by file to provide better context
+            if (file.chunks.length <= 3) {
+                // For files with few chunks, analyze the entire file at once
+                const combinedChunk = {
+                    content: file.chunks.map(c => c.content).join("\n"),
+                    changes: file.chunks.flatMap(c => c.changes)
+                };
+                const prompt = createPrompt(file, combinedChunk, prDetails);
                 const aiResponse = yield getAIResponse(prompt);
                 if (aiResponse) {
-                    const newComments = createComment(file, chunk, aiResponse);
+                    const newComments = createComment(file, combinedChunk, aiResponse);
                     if (newComments) {
                         comments.push(...newComments);
                     }
                 }
             }
+            else {
+                // For larger files, process chunks individually but with a limit on changes
+                for (let i = 0; i < file.chunks.length; i++) {
+                    const chunk = file.chunks[i];
+                    // Skip chunks that are too small (likely minor changes)
+                    if (chunk.changes.length < 3) {
+                        continue;
+                    }
+                    // For chunks with too many changes, we might want to split them
+                    if (chunk.changes.length > maxChangesPerChunk) {
+                        // Process the chunk as is, but the prompt will instruct to focus only on significant issues
+                        const prompt = createPrompt(file, chunk, prDetails);
+                        const aiResponse = yield getAIResponse(prompt);
+                        if (aiResponse) {
+                            const newComments = createComment(file, chunk, aiResponse);
+                            if (newComments) {
+                                comments.push(...newComments);
+                            }
+                        }
+                    }
+                    else {
+                        // Try to combine with next chunk if they're close together
+                        if (i < file.chunks.length - 1) {
+                            const nextChunk = file.chunks[i + 1];
+                            const combinedChanges = [...chunk.changes, ...nextChunk.changes];
+                            if (combinedChanges.length <= maxChangesPerChunk) {
+                                // Combine chunks for better context
+                                const combinedChunk = {
+                                    content: chunk.content + "\n" + nextChunk.content,
+                                    changes: combinedChanges
+                                };
+                                const prompt = createPrompt(file, combinedChunk, prDetails);
+                                const aiResponse = yield getAIResponse(prompt);
+                                if (aiResponse) {
+                                    const newComments = createComment(file, combinedChunk, aiResponse);
+                                    if (newComments) {
+                                        comments.push(...newComments);
+                                    }
+                                }
+                                // Skip the next chunk since we've already processed it
+                                i++;
+                                continue;
+                            }
+                        }
+                        // Process the chunk individually
+                        const prompt = createPrompt(file, chunk, prDetails);
+                        const aiResponse = yield getAIResponse(prompt);
+                        if (aiResponse) {
+                            const newComments = createComment(file, chunk, aiResponse);
+                            if (newComments) {
+                                comments.push(...newComments);
+                            }
+                        }
+                    }
+                }
+            }
         }
-        return comments;
+        // Limit the total number of comments to prevent overwhelming the PR
+        return comments.slice(0, MAX_COMMENTS_PER_PR);
     });
 }
 function createPrompt(file, chunk, prDetails) {
     return `Your task is to review pull requests. Instructions:
 - Provide the response in following JSON format:  {"reviews": [{"lineNumber":  <line_number>, "reviewComment": "<review comment>"}]}
 - Do not give positive comments or compliments.
-- Provide comments and suggestions ONLY if there is something to improve, otherwise "reviews" should be an empty array.
+- Focus ONLY on significant functional issues, potential bugs, security concerns, and important performance problems.
+- IGNORE minor stylistic issues like:
+  * Variable naming (unless extremely misleading)
+  * Indentation or whitespace
+  * Missing newlines
+  * Comment formatting or wording
+  * Other cosmetic issues
+- Provide comments ONLY for issues that could impact functionality, security, or performance.
+- If no significant issues are found, "reviews" should be an empty array.
 - Write the comment in GitHub Markdown format.
 - Use the given description only for the overall context and only comment the code.
 - IMPORTANT: NEVER suggest adding comments to the code.
+- Limit to at most 2-3 high-value comments per chunk.
 
 Review the following code diff in the file "${file.to}" and take the pull request title and description into account when writing the response.
   
@@ -128,7 +202,6 @@ Git diff to review:
 \`\`\`diff
 ${chunk.content}
 ${chunk.changes
-        // @ts-expect-error - ln and ln2 exists where needed
         .map((c) => `${c.ln ? c.ln : c.ln2} ${c.content}`)
         .join("\n")}
 \`\`\`
@@ -139,11 +212,11 @@ function getAIResponse(prompt) {
     return __awaiter(this, void 0, void 0, function* () {
         const queryConfig = {
             model: OPENAI_API_MODEL,
-            temperature: 0.2,
+            temperature: 0.4,
             max_tokens: 700,
             top_p: 1,
-            frequency_penalty: 0,
-            presence_penalty: 0,
+            frequency_penalty: 0.2,
+            presence_penalty: 0.2, // Slight increase to encourage more diverse thinking
         };
         try {
             const response = yield openai.chat.completions.create(Object.assign(Object.assign(Object.assign({}, queryConfig), (OPENAI_API_MODEL === "gpt-4-1106-preview"
@@ -168,10 +241,21 @@ function createComment(file, chunk, aiResponses) {
         if (!file.to) {
             return [];
         }
+        // Validate that the line number is within the range of the file
+        const lineNumber = Number(aiResponse.lineNumber);
+        if (isNaN(lineNumber) || lineNumber <= 0) {
+            console.log(`Skipping comment with invalid line number: ${aiResponse.lineNumber}`);
+            return [];
+        }
+        // Check if the comment is too short (likely not meaningful)
+        if (aiResponse.reviewComment.length < 20) {
+            console.log(`Skipping too short comment: ${aiResponse.reviewComment}`);
+            return [];
+        }
         return {
             body: aiResponse.reviewComment,
             path: file.to,
-            line: Number(aiResponse.lineNumber),
+            line: lineNumber,
         };
     });
 }
